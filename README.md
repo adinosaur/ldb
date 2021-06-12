@@ -2,7 +2,7 @@
 **ldb** defines an interactive source code debugger for LUA programs like Python's pdb module.
 
 # Usage
-To use **ldb**, first you need to insert a trace point in your programs.
+First you need to insert a trace point in your programs.
 ```lua
 
 local a = 1
@@ -13,7 +13,7 @@ ldb.set_trace() -- <== start trace here
 print("kk")
 ```
 
-after call function `set_trace()`, programs will stop running, and open an interactive console.
+After call function `set_trace()`, programs will stop running, and open an interactive console.
 ```
 > 6    print("kk")
 (ldb)
