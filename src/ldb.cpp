@@ -27,6 +27,14 @@ std::vector<std::string>& split(const std::string &s, char delim, std::vector<st
     return elems;
 }
 
+std::string join(char delim, std::vector<std::string> &elems)
+{
+    std::ostringstream os;
+    for (auto& s : elems)
+        os << s << delim;
+    return os.str();
+}
+
 static int env_index(lua_State* L)
 {
     int locals = lua_upvalueindex(1);
@@ -145,6 +153,10 @@ static int create_env(lua_State* L, int stacklevel)
     lua_newtable(L);
     int env = lua_gettop(L);
 
+    // keep alive from GC!
+    lua_pushthread(L);
+    lua_setfield(L, env, "cache_thread");
+
     lua_newtable(L);
     int mt = lua_gettop(L);
     
@@ -191,6 +203,7 @@ static int create_env(lua_State* L, int stacklevel)
     lua_setfield(L, mt, "__index");
 
     // metamethod: __newindex
+    // upvalues: empty
     lua_pushcclosure(L, env_newindex, 0);
     lua_setfield(L, mt, "__newindex");
 
@@ -202,27 +215,34 @@ static int create_env(lua_State* L, int stacklevel)
     return 0;
 }
 
-static int bpid;
-
 class BreakPoint
 {
+
 public:
-    BreakPoint()
+    BreakPoint(lua_State* L, int traceframe, int lineno, const std::string& cond)
     : id(++bpid)
-    {}
+    , lineno(lineno)
+    , condition(cond)
+    {
+        lua_getstack(L, traceframe, &cache_entry);
+        lua_getinfo(L, "Sln", &cache_entry);
+    }
+
+    BreakPoint(const BreakPoint&) = delete;
+    BreakPoint& operator=(const BreakPoint&) = delete;
 
     int get_id() { return id; }
 
-    void setup(lua_State* L, lua_Debug* entry, int lineno, const std::string& cond)
+    bool ishit(lua_State* L)
     {
-        this->source = entry->source;
-        this->lineno = lineno;
-        this->condition = cond;
-    }
+        lua_Debug entry;
+        lua_getstack(L, 0, &entry);
+        lua_getinfo(L, "Sln", &entry);
 
-    bool ishit(lua_State* L, lua_Debug* entry)
-    {
-        if (lineno != entry->currentline || source != entry->source)
+        if (lineno != entry.currentline)
+            return false;
+        
+        if (strcmp(cache_entry.source, entry.source) != 0)
             return false;
 
         if (condition.empty())
@@ -235,7 +255,7 @@ public:
             int r = luaL_loadstring(L, expr.c_str());
             if (r != LUA_OK)
             {
-                printf("setup breakpoint failed, invalid cond: %s\n", condition.c_str());
+                printf("test breakpoint failed, invalid cond: %s\n", condition.c_str());
                 return -1;
             }
 
@@ -262,17 +282,99 @@ public:
     void print()
     {
         if (condition.empty())
-            printf("break %d in %s:%d\n", id, source.c_str(), lineno);
+            printf("break %d in %s:%d\n", id, cache_entry.source, lineno);
         else
-            printf("break %d in %s:%d if %s\n", id, source.c_str(), lineno, condition.c_str());
+            printf("break %d in %s:%d if %s\n", id, cache_entry.source, lineno, condition.c_str());
     }
 
 private:
+    static int bpid;
+    
     int id;
-    std::string source;
     int lineno;
+    lua_Debug cache_entry;
     std::string condition;
 };
+
+int BreakPoint::bpid = 0;
+
+class WatchPoint
+{
+public:
+    WatchPoint(lua_State* L, int traceframe, const std::string& cond)
+    : id(++wpid)
+    , condition(cond)
+    , ref(LUA_NOREF)
+    {
+        cache_thread = L;
+        lua_getstack(L, traceframe, &cache_entry);
+        lua_getinfo(L, "Sln", &cache_entry);
+        
+        setup(L, traceframe, cond);
+    }
+
+    ~WatchPoint()
+    {
+        luaL_unref(cache_thread, LUA_REGISTRYINDEX, ref);
+    }
+
+    WatchPoint(const WatchPoint&) = delete;
+    WatchPoint& operator=(const WatchPoint&) = delete;
+
+    bool ishit(lua_State* L)
+    {
+        bool ishit = false;
+        lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+        int r = lua_pcall(L, 0, 1, 0);
+        if (r != LUA_OK)
+        {
+            printf("check watchpoint %d condition failed, error: %s\n", id, lua_tostring(L, -1));
+            ishit = true;
+        }
+        else
+        {
+            if (lua_toboolean(L, -1))
+                ishit = true;
+            lua_pop(L, 1);
+        }
+        return ishit;
+    }
+
+    void print()
+    {
+        printf("watch %d in %s:%d if %s\n", id, cache_entry.source, cache_entry.currentline, condition.c_str());
+    }
+
+private:
+    int setup(lua_State* L, int traceframe, const std::string& cond)
+    {
+        std::string expr = "return " + cond;
+        int r = luaL_loadstring(L, expr.c_str());
+        if (r != LUA_OK)
+        {
+            printf("test breakpoint failed, invalid cond: %s\n", cond.c_str());
+            return -1;
+        }
+
+        int cond_index = lua_gettop(L);
+        create_env(L, traceframe);
+        lua_setupvalue(L, cond_index, 1);
+        ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        cache_thread = L;
+        return 0;
+    }
+
+    static int wpid;
+    
+    int id;
+    lua_State* cache_thread; // 需要考虑到缓存的lua_State的生命周期问题
+    lua_Debug cache_entry;
+    std::string condition;
+    int ref; // 引用全局注册表的索引
+};
+
+int WatchPoint::wpid = 0;
+
 
 #define PROMPT "(ldb) "
 
@@ -361,6 +463,8 @@ public:
             do_delete(inputs);
         else if (cmd == "q" || cmd == "quit")
             do_quit();
+        else if (cmd == "w" || cmd == "watch")
+            do_watch(inputs);
     }
 
     // cmd: help
@@ -379,6 +483,7 @@ public:
                             "b (break) lineno [if cond] -- Set a breakpoint in currentfile:lineno. If cond present, it will not stop excute unitl cond is true\n"
                             "d (delete) [breakpoint id] -- Delete a breakpoint. If not args, it will delete all breakpoints\n"
                             "q (quit)\t\t-- Stop tracing\n";
+                            "w (watch)\t\t-- Coming soon, no support now\n";
         std::cout << HELP;
     }
 
@@ -494,6 +599,7 @@ public:
         create_env(L, traceframe);
         lua_setupvalue(L, function_index, 1);
         lua_pcall(L, 0, 1, 0);
+        lua_pop(L, 1);
     }
 
     // cmd: f(rame)
@@ -561,19 +667,14 @@ public:
             return;
         }
 
-        std::string cond;
+        std::vector<std::string> cond;
         if (inputs.size() > 3 && inputs[2] == "if")
         {
             for (int i = 3; i < inputs.size(); i++)
-                cond += inputs[i];
+                cond.push_back(inputs[i]);
         }
-
-        lua_Debug entry;
-        lua_getstack(L, traceframe, &entry);
-        lua_getinfo(L, "Sln", &entry);
         
-        BreakPoint* bp = new BreakPoint();
-        bp->setup(L, &entry, lineno, cond);
+        BreakPoint* bp = new BreakPoint(L, traceframe, lineno, join(' ', cond));
         breaks.push_back(bp);
         bp->print();
     }
@@ -583,11 +684,9 @@ public:
     {
         if (inputs.size() < 2)
         {
-            // list breaks
+            // delete all breaks
             for (auto bp : breaks)
-            {
                 delete bp;
-            }
             breaks.clear();
             return;
         }
@@ -621,6 +720,26 @@ public:
     {
         running = false;
         do_continue();
+    }
+
+    // cmd: w(atch)
+    void do_watch(std::vector<std::string>& inputs)
+    {
+        if (inputs.size() < 2)
+        {
+            // list watchs
+            for (auto wp : watchs)
+                wp->print();
+            return;
+        }
+
+        std::vector<std::string> cond;
+        for (int i = 1; i < inputs.size(); i++)
+            cond.push_back(inputs[i]);
+        
+        WatchPoint* wp = new WatchPoint(L, traceframe, join(' ', cond));
+        watchs.push_back(wp);
+        wp->print();
     }
 
     int get_stacksize()
@@ -659,12 +778,27 @@ public:
 
     bool break_here()
     {
-        lua_Debug entry;
-        lua_getstack(L, 0, &entry);
-        lua_getinfo(L, "Sln", &entry);
         for (auto bp : breaks)
-            if (bp->ishit(L, &entry))
+        {
+            if (bp->ishit(L))
+            {
+                bp->print();
                 return true;
+            }
+        }
+        return false;
+    }
+
+    bool watch_here()
+    {
+        for (auto wp : watchs)
+        {
+            if (wp->ishit(L))
+            {
+                wp->print();
+                return true;
+            }
+        }
         return false;
     }
 
@@ -696,7 +830,7 @@ public:
 
     void dispatch_line()
     {
-        if (stop_here() || break_here())
+        if (stop_here() || break_here() || watch_here())
         {
             reset();
             user_line();
@@ -728,6 +862,7 @@ private:
     lua_Debug* ar;
 
     std::vector<BreakPoint*> breaks;
+    std::vector<WatchPoint*> watchs;
 
     std::string cache_filename;
     std::vector<std::string> cache_lines;
